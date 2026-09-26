@@ -1,0 +1,377 @@
+pipeline {
+    agent {
+        label 'gcp-deploy'
+    }
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+
+        disableConcurrentBuilds()
+
+        timestamps()
+
+        skipDefaultCheckout(true)
+    }
+
+    triggers {
+        githubPush()
+    }
+
+    environment {
+        PROJECT_ID          = 'theshortlistd-production'
+        ZONE                = 'asia-southeast1-c'
+        INSTANCE_NAME       = 'shortlistd-prod-march-2026'
+
+        REMOTE_APP_PATH    = '/var/www/html/nivasabid'
+        REMOTE_BACKUP_PATH = '/home/raos_infosoftjoin/auction_site/bak/ui'
+
+        LOCAL_BUILD_DIR    = 'dist'
+
+        GCP_CREDENTIALS_ID  = 'gcp-deploy-sa'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                sh '''
+                    echo "======================================="
+                    echo "Repository"
+                    echo "======================================="
+                    git remote -v
+
+                    echo ""
+                    echo "Branch:"
+                    git branch --show-current
+
+                    echo ""
+                    echo "Commit:"
+                    git rev-parse --short HEAD
+                '''
+            }
+        }
+
+        stage('Validate QA Branch') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME != 'qa') {
+                        echo "Branch '${env.BRANCH_NAME}' is not QA."
+                        echo "QA deployment will be skipped."
+                        currentBuild.result = 'NOT_BUILT'
+                        return
+                    }
+
+                    echo "QA branch detected."
+                    echo "Proceeding with QA deployment."
+                }
+            }
+        }
+
+        stage('Build React Application') {
+            when {
+                branch 'qa'
+            }
+
+            steps {
+                sh '''
+                    set -eux
+
+                    echo "Node version:"
+                    node --version
+
+                    echo ""
+                    echo "NPM version:"
+                    npm --version
+
+                    echo ""
+                    echo "Installing dependencies...."
+                    npm ci
+
+                    echo ""
+                    echo "Building React application...."
+                    npm run build
+
+                    echo ""
+                    echo "Build output:"
+                    ls -lah "${LOCAL_BUILD_DIR}"
+
+                    echo ""
+                    echo "Build completed successfully."
+                '''
+            }
+        }
+
+        stage('Authenticate to GCP') {
+            when {
+                branch 'qa'
+            }
+
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: "${GCP_CREDENTIALS_ID}",
+                        variable: 'GCP_KEY_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set -eux
+
+                        echo "Authenticating to GCP..."
+
+                        gcloud auth activate-service-account \
+                            --key-file="$GCP_KEY_FILE"
+
+                        gcloud config set project "$PROJECT_ID"
+
+                        echo ""
+                        echo "Active GCP account:"
+                        gcloud auth list --filter=status:ACTIVE
+
+                        echo ""
+                        echo "GCP project:"
+                        gcloud config get-value project
+                    '''
+                }
+            }
+        }
+
+        stage('Backup Existing Website') {
+            when {
+                branch 'qa'
+            }
+
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: "${GCP_CREDENTIALS_ID}",
+                        variable: 'GCP_KEY_FILE'
+                    )
+                ]) {
+                    sh '''
+                        set -eux
+
+                        gcloud auth activate-service-account \
+                            --key-file="$GCP_KEY_FILE"
+
+                        gcloud config set project "$PROJECT_ID"
+
+                        echo "Creating backup on GCP VM..."
+
+                        gcloud compute ssh "$INSTANCE_NAME" \
+                            --zone="$ZONE" \
+                            --command="
+                                set -e
+
+                                sudo mkdir -p '$REMOTE_BACKUP_PATH'
+
+                                if [ -d '$REMOTE_APP_PATH' ]; then
+                                    sudo tar -czf \
+                                        '$REMOTE_BACKUP_PATH/nivasabid-backup-\\$(date +%Y%m%d-%H%M%S).tar.gz' \
+                                        -C '$REMOTE_APP_PATH' .
+                                else
+                                    echo 'WARNING: $REMOTE_APP_PATH does not exist.'
+                                    echo 'Skipping backup.'
+                                fi
+                            "
+
+                        echo "Backup stage completed."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to GCP VM') {
+            when {
+                branch 'qa'
+            }
+
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: "${GCP_CREDENTIALS_ID}",
+                        variable: 'GCP_KEY_FILE'
+                    )
+                ]) {
+                    script {
+
+                        try {
+
+                            sh '''
+                                set -eux
+
+                                gcloud auth activate-service-account \
+                                    --key-file="$GCP_KEY_FILE"
+
+                                gcloud config set project "$PROJECT_ID"
+
+                                echo "Preparing remote staging directory..."
+
+                                gcloud compute ssh "$INSTANCE_NAME" \
+                                    --zone="$ZONE" \
+                                    --command="
+                                        rm -rf /tmp/nivasabid-build
+                                        mkdir -p /tmp/nivasabid-build
+                                    "
+
+                                echo "Copying React build to GCP VM..."
+
+                                gcloud compute scp \
+                                    --recurse \
+                                    "${LOCAL_BUILD_DIR}/." \
+                                    "$INSTANCE_NAME:/tmp/nivasabid-build" \
+                                    --zone="$ZONE"
+
+                                echo "Installing build..."
+
+                                gcloud compute ssh "$INSTANCE_NAME" \
+                                    --zone="$ZONE" \
+                                    --command="
+                                        set -e
+
+                                        sudo mkdir -p '$REMOTE_APP_PATH'
+
+                                        sudo rm -rf '$REMOTE_APP_PATH'/*
+
+                                        sudo rsync -av \
+                                            /tmp/nivasabid-build/ \
+                                            '$REMOTE_APP_PATH/'
+
+                                        sudo rm -rf /tmp/nivasabid-build
+
+                                        echo 'Deployment files copied successfully.'
+                                    "
+                            '''
+
+                            echo "Deployment completed successfully."
+
+                        } catch (err) {
+
+                            echo "Deployment failed."
+                            echo "Rollback will NOT happen here automatically because deployment verification has not yet completed."
+
+                            throw err
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Post-Deployment Verification') {
+            when {
+                branch 'qa'
+            }
+
+            steps {
+                script {
+
+                    try {
+
+                        sh '''
+                            set -eux
+
+                            echo "Waiting for deployment to settle..."
+                            sleep 5
+
+                            echo "Checking application..."
+
+                            STATUS=$(curl \
+                                -o /dev/null \
+                                -s \
+                                -w "%{http_code}" \
+                                "http://nivasabid.theshortlistd.org/")
+
+                            echo "HTTP status: $STATUS"
+
+                            if [ "$STATUS" -ne 200 ]; then
+                                echo "Deployment verification FAILED."
+                                exit 1
+                            fi
+
+                            echo "Deployment verified successfully."
+                        '''
+
+                    } catch (err) {
+
+                        echo "Post-deployment verification failed."
+                        echo "Starting rollback..."
+
+                        withCredentials([
+                            file(
+                                credentialsId: "${GCP_CREDENTIALS_ID}",
+                                variable: 'GCP_KEY_FILE'
+                            )
+                        ]) {
+
+                            sh '''
+                                set -eux
+
+                                gcloud auth activate-service-account \
+                                    --key-file="$GCP_KEY_FILE"
+
+                                gcloud config set project "$PROJECT_ID"
+
+                                gcloud compute ssh "$INSTANCE_NAME" \
+                                    --zone="$ZONE" \
+                                    --command="
+                                        set -e
+
+                                        echo 'Finding latest backup...'
+
+                                        LATEST_BACKUP=\\$(ls -t \
+                                            '$REMOTE_BACKUP_PATH'/nivasabid-backup-*.tar.gz \
+                                            2>/dev/null | head -n 1 || true)
+
+                                        if [ -z \"\\$LATEST_BACKUP\" ]; then
+                                            echo 'ERROR: No backup found.'
+                                            echo 'Manual intervention required.'
+                                            exit 1
+                                        fi
+
+                                        echo \"Using backup: \\$LATEST_BACKUP\"
+
+                                        sudo rm -rf '$REMOTE_APP_PATH'/*
+
+                                        sudo tar \
+                                            -xzf \"\\$LATEST_BACKUP\" \
+                                            -C '$REMOTE_APP_PATH'
+
+                                        echo 'Rollback completed.'
+                                    "
+                            '''
+                        }
+
+                        error("Deployment verification failed. Rollback was attempted.")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "========================================"
+            echo "QA DEPLOYMENT SUCCESSFUL"
+            echo "========================================"
+        }
+
+        failure {
+            echo "========================================"
+            echo "QA DEPLOYMENT FAILED"
+            echo "========================================"
+        }
+
+        aborted {
+            echo "========================================"
+            echo "QA DEPLOYMENT ABORTED"
+            echo "========================================"
+        }
+
+        always {
+            echo "Jenkins build: ${env.BUILD_NUMBER}"
+            echo "Branch: ${env.BRANCH_NAME}"
+            echo "Commit: ${env.GIT_COMMIT ?: 'N/A'}"
+        }
+    }
+}

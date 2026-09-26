@@ -1,0 +1,1361 @@
+pipeline {
+
+    agent {
+        label 'gcp-deploy'
+    }
+
+    options {
+        buildDiscarder(logRotator(
+        numToKeepStr: '20',
+        artifactNumToKeepStr: '10'
+        ))
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+
+        // =====================================================
+        // GCP
+        // =====================================================
+
+        PROJECT_ID    = 'theshortlistd-production'
+        ZONE          = 'asia-southeast1-c'
+        INSTANCE_NAME = 'shortlistd-prod-march-2026'
+
+        GCP_CREDENTIALS_ID = 'gcp-deploy-sa'
+
+        // All VM operations are performed as runner.
+        REMOTE_USER = 'runner'
+
+
+        // =====================================================
+        // Maven
+        // =====================================================
+
+        MAVEN_VERSION = '3.9.14'
+        MAVEN_HOME    = "${WORKSPACE}/.maven"
+
+
+        // =====================================================
+        // Master API
+        // =====================================================
+
+        MASTER_DIR          = 'Auction_Master_Api'
+        MASTER_JAR          = 'nivasabid.jar'
+        MASTER_DEPLOY_PATH  = '/home/raos_infosoftjoin/auction_site/api'
+        MASTER_START_SCRIPT = 'start_service.sh'
+        MASTER_HEALTH_URL   = 'http://localhost:8083/actuator/health'
+
+
+        // =====================================================
+        // Participation Service
+        // =====================================================
+
+        PARTICIPATION_DIR          = 'Participation_Service'
+        PARTICIPATION_JAR          = 'auction-participation-service.jar'
+        PARTICIPATION_DEPLOY_PATH  = '/home/raos_infosoftjoin/auction_site/services'
+        PARTICIPATION_START_SCRIPT = 'start_service.sh'
+        PARTICIPATION_HEALTH_URL   = 'http://localhost:8087/actuator/health'
+
+
+        // =====================================================
+        // Bidding Service
+        // =====================================================
+
+        BIDDING_DIR          = 'Bidding_Service'
+        BIDDING_JAR          = 'auction-bidding-service.jar'
+        BIDDING_DEPLOY_PATH  = '/home/raos_infosoftjoin/auction_site/services'
+        BIDDING_START_SCRIPT = 'auction-bidding.sh'
+        BIDDING_HEALTH_URL   = 'http://localhost:8088/actuator/health'
+    }
+
+
+    stages {
+
+
+        // =====================================================
+        // 1. CHECKOUT
+        // =====================================================
+
+        stage('Checkout') {
+
+            steps {
+
+                checkout scm
+
+                sh '''
+                    set -eux
+
+                    echo "=========================================="
+                    echo "Repository"
+                    echo "=========================================="
+
+                    git remote -v
+
+                    echo ""
+                    echo "Branch:"
+                    git branch --show-current || true
+
+                    echo ""
+                    echo "Commit:"
+                    git rev-parse --short HEAD
+
+                    echo ""
+                    echo "Full commit:"
+                    git rev-parse HEAD
+
+                    echo ""
+                    echo "Java:"
+                    java -version
+                '''
+            }
+        }
+
+
+        // =====================================================
+        // 2. VALIDATE QA
+        // =====================================================
+
+        stage('Validate QA Branch') {
+
+            steps {
+
+                script {
+
+                    echo "Branch: ${env.BRANCH_NAME}"
+
+                    if (env.BRANCH_NAME != 'QA') {
+
+                        error(
+                            "This deployment pipeline only supports the QA branch. " +
+                            "Current branch: ${env.BRANCH_NAME}"
+                        )
+                    }
+                }
+            }
+        }
+
+
+        // =====================================================
+        // 3. DETECT CHANGED SERVICES
+        // =====================================================
+
+        stage('Detect Changed Services') {
+
+            steps {
+
+                script {
+
+                    def previousCommit = sh(
+                        script: "git rev-parse HEAD^ 2>/dev/null || true",
+                        returnStdout: true
+                    ).trim()
+
+                    def changedFiles = ""
+
+                    if (previousCommit) {
+
+                        changedFiles = sh(
+                            script: "git diff --name-only ${previousCommit} HEAD",
+                            returnStdout: true
+                        ).trim()
+
+                    } else {
+
+                        echo ""
+                        echo "No previous commit found."
+                        echo "No service will be deployed automatically."
+                    }
+
+
+                    echo ""
+                    echo "=========================================="
+                    echo "CHANGED FILES"
+                    echo "=========================================="
+
+                    if (changedFiles) {
+
+                        echo changedFiles
+
+                    } else {
+
+                        echo "No changed files detected."
+                    }
+
+
+                    def files = changedFiles
+                        ? changedFiles.readLines()
+                        : []
+
+
+                    // =================================================
+                    // ONLY DIRECTORY-BASED DETECTION
+                    //
+                    // Master:
+                    //     Auction_Master_Api/**
+                    //
+                    // Participation:
+                    //     Participation_Service/**
+                    //
+                    // Bidding:
+                    //     Bidding_Service/**
+                    //
+                    // Nothing else triggers deployment.
+                    // =================================================
+
+                    def buildMaster = files.any {
+                        it.startsWith("${env.MASTER_DIR}/")
+                    }
+
+                    def buildParticipation = files.any {
+                        it.startsWith("${env.PARTICIPATION_DIR}/")
+                    }
+
+                    def buildBidding = files.any {
+                        it.startsWith("${env.BIDDING_DIR}/")
+                    }
+
+
+                    // Persist decisions.
+
+                    env.BUILD_MASTER =
+                        buildMaster.toString()
+
+                    env.BUILD_PARTICIPATION =
+                        buildParticipation.toString()
+
+                    env.BUILD_BIDDING =
+                        buildBidding.toString()
+
+                    env.MASTER_BUILD_OK = 'not-run'
+                    env.PARTICIPATION_BUILD_OK = 'not-run'
+                    env.BIDDING_BUILD_OK = 'not-run'
+                    env.MASTER_DEPLOY_OK = 'not-run'
+                    env.PARTICIPATION_DEPLOY_OK = 'not-run'
+                    env.BIDDING_DEPLOY_OK = 'not-run'
+
+
+                    echo ""
+                    echo "=========================================="
+                    echo "SERVICE DECISION"
+                    echo "=========================================="
+
+                    echo "Master API       : ${env.BUILD_MASTER}"
+                    echo "Participation    : ${env.BUILD_PARTICIPATION}"
+                    echo "Bidding          : ${env.BUILD_BIDDING}"
+
+                    echo "=========================================="
+
+
+                    if (!buildMaster &&
+                        !buildParticipation &&
+                        !buildBidding) {
+
+                        echo ""
+                        echo "No service directory changed."
+                        echo "No build or deployment required."
+                        echo "Pipeline will finish successfully."
+                        echo ""
+                    }
+                }
+            }
+        }
+
+
+        // =====================================================
+        // 4. PREPARE BUILD ENVIRONMENT
+        //
+        // Only install Maven when at least one service changed.
+        // =====================================================
+
+        stage('Prepare Build Environment') {
+
+            when {
+
+                anyOf {
+
+                    expression {
+                        env.BUILD_MASTER == 'true'
+                    }
+
+                    expression {
+                        env.BUILD_PARTICIPATION == 'true'
+                    }
+
+                    expression {
+                        env.BUILD_BIDDING == 'true'
+                    }
+                }
+            }
+
+            steps {
+                script {
+                    try {
+                        sh '''
+                    set -eux
+
+                    echo "=========================================="
+                    echo "Preparing Build Environment"
+                    echo "=========================================="
+
+                    echo "Workspace:"
+                    pwd
+
+                    echo ""
+                    echo "Java:"
+                    java -version
+
+                    echo ""
+                    echo "Installing Maven ${MAVEN_VERSION}..."
+
+                    rm -rf "$MAVEN_HOME"
+
+                    mkdir -p "$MAVEN_HOME"
+
+                    curl -fsSL \
+                        "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}/apache-maven-${MAVEN_VERSION}-bin.zip" \
+                        -o /tmp/apache-maven.zip
+
+                    unzip -q \
+                        /tmp/apache-maven.zip \
+                        -d "$MAVEN_HOME"
+
+                    rm -f /tmp/apache-maven.zip
+
+                    echo ""
+                    echo "Maven installation:"
+                    ls -la "$MAVEN_HOME"
+
+                    echo ""
+                    echo "Maven version:"
+
+                    "$MAVEN_HOME/apache-maven-${MAVEN_VERSION}/bin/mvn" \
+                        -version
+                        '''
+                        env.PREPARE_OK = 'true'
+                    } catch (err) {
+                        env.PREPARE_OK = 'false'
+                        currentBuild.result = 'FAILURE'
+                        echo "Maven preparation failed: ${err}"
+                    }
+                }
+            }
+        }
+
+
+        // =====================================================
+        // 5. BUILD MASTER API
+        // =====================================================
+
+        stage('Build Master API') {
+            when { expression { env.BUILD_MASTER == 'true' } }
+            steps {
+                script {
+                    if (env.PREPARE_OK != 'true') {
+                        env.MASTER_BUILD_OK = 'false'
+                        currentBuild.result = 'FAILURE'
+                        echo 'Build Master API skipped because Maven preparation failed.'
+                    } else try {
+                        sh '''
+                            set -eu
+                            "$MAVEN_HOME/apache-maven-${MAVEN_VERSION}/bin/mvn" \
+                              -f Auction_Master_Api/pom.xml clean package -DskipTests
+                            test -s Auction_Master_Api/target/nivasabid.jar
+                        '''
+                        env.MASTER_BUILD_OK = 'true'
+                        echo 'Build Master API succeeded.'
+                    } catch (err) {
+                        env.MASTER_BUILD_OK = 'false'
+                        currentBuild.result = 'FAILURE'
+                        echo 'Build Master API failed: ${err}'
+                    }
+                }
+            }
+        }
+
+        stage('Build Participation Service') {
+            when { expression { env.BUILD_PARTICIPATION == 'true' } }
+            steps {
+                script {
+                    if (env.PREPARE_OK != 'true') {
+                        env.PARTICIPATION_BUILD_OK = 'false'
+                        currentBuild.result = 'FAILURE'
+                        echo 'Build Participation Service skipped because Maven preparation failed.'
+                    } else try {
+                        sh '''
+                            set -eu
+                            "$MAVEN_HOME/apache-maven-${MAVEN_VERSION}/bin/mvn" \
+                              -f Participation_Service/pom.xml clean package -DskipTests
+                            test -s Participation_Service/target/auction-participation-service.jar
+                        '''
+                        env.PARTICIPATION_BUILD_OK = 'true'
+                        echo 'Build Participation Service succeeded.'
+                    } catch (err) {
+                        env.PARTICIPATION_BUILD_OK = 'false'
+                        currentBuild.result = 'FAILURE'
+                        echo 'Build Participation Service failed: ${err}'
+                    }
+                }
+            }
+        }
+
+        stage('Build Bidding Service') {
+            when { expression { env.BUILD_BIDDING == 'true' } }
+            steps {
+                script {
+                    if (env.PREPARE_OK != 'true') {
+                        env.BIDDING_BUILD_OK = 'false'
+                        currentBuild.result = 'FAILURE'
+                        echo 'Build Bidding Service skipped because Maven preparation failed.'
+                    } else try {
+                        sh '''
+                            set -eu
+                            "$MAVEN_HOME/apache-maven-${MAVEN_VERSION}/bin/mvn" \
+                              -f Bidding_Service/pom.xml clean package -DskipTests
+                            test -s Bidding_Service/target/auction-bidding-service.jar
+                        '''
+                        env.BIDDING_BUILD_OK = 'true'
+                        echo 'Build Bidding Service succeeded.'
+                    } catch (err) {
+                        env.BIDDING_BUILD_OK = 'false'
+                        currentBuild.result = 'FAILURE'
+                        echo 'Build Bidding Service failed: ${err}'
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Changed Services') {
+
+            when {
+
+                anyOf {
+
+                    expression {
+                        env.BUILD_MASTER == 'true'
+                    }
+
+                    expression {
+                        env.BUILD_PARTICIPATION == 'true'
+                    }
+
+                    expression {
+                        env.BUILD_BIDDING == 'true'
+                    }
+                }
+            }
+
+            steps {
+
+                script {
+
+                    withCredentials([
+                        file(
+                            credentialsId: "${GCP_CREDENTIALS_ID}",
+                            variable: 'GCP_KEY_FILE'
+                        )
+                    ]) {
+
+
+                        // =================================================
+                        // GCP AUTHENTICATION
+                        // =================================================
+
+                        sh '''
+                            set -eux
+
+                            echo "=========================================="
+                            echo "GCP AUTHENTICATION"
+                            echo "=========================================="
+
+                            gcloud auth activate-service-account \
+                                --key-file="$GCP_KEY_FILE"
+
+                            gcloud config set project "$PROJECT_ID"
+
+                            echo ""
+                            echo "Active GCP account:"
+
+                            gcloud auth list \
+                                --filter=status:ACTIVE
+
+                            echo ""
+                            echo "GCP project:"
+
+                            gcloud config get-value project
+                        '''
+
+
+                        // =================================================
+                        // MASTER API
+                        // =================================================
+
+                        if (env.BUILD_MASTER == 'true') {
+
+                            echo ""
+                            echo "=========================================="
+                            echo "DEPLOYING MASTER API"
+                            echo "=========================================="
+
+                            try {
+
+                                // -----------------------------------------
+                                // Prepare deployment directory
+                                // -----------------------------------------
+                                
+                                sh '''
+                                    set -eux
+                                
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            set -e
+                                
+                                            mkdir -p '${MASTER_DEPLOY_PATH}/.jenkins-deploy'
+                                
+                                            rm -f \
+                                                '${MASTER_DEPLOY_PATH}/.jenkins-deploy/${MASTER_JAR}-${BUILD_NUMBER}'
+                                        "
+                                '''
+                                
+                                
+                                // -----------------------------------------
+                                // Upload JAR
+                                // -----------------------------------------
+                                
+                                sh '''
+                                    set -eux
+                                
+                                    echo "Uploading Master API JAR..."
+                                
+                                    gcloud compute scp \
+                                        "Auction_Master_Api/target/${MASTER_JAR}" \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}:${MASTER_DEPLOY_PATH}/.jenkins-deploy/${MASTER_JAR}-${BUILD_NUMBER}" \
+                                        --zone="${ZONE}"
+                                '''
+
+                                // -----------------------------------------
+                                // Backup current JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            set -e
+
+                                            DEPLOY_PATH='${MASTER_DEPLOY_PATH}'
+                                            BACKUP_PATH='/home/raos_infosoftjoin/auction_site/bak'
+                                            JAR_NAME='${MASTER_JAR}'
+                                            APP_NAME='auction-site-api'
+
+                                            mkdir -p \\\"\\$BACKUP_PATH\\\"
+
+                                            if [ -f \\\"\\$DEPLOY_PATH/\\$JAR_NAME\\\" ]; then
+
+                                                BACKUP_FILE=\\\"\\$BACKUP_PATH/\\${APP_NAME}-\\$(date +%Y%m%d-%H%M%S).jar\\\"
+
+                                                cp \
+                                                    \\\"\\$DEPLOY_PATH/\\$JAR_NAME\\\" \
+                                                    \\\"\\$BACKUP_FILE\\\"
+
+                                                echo \\\"Backup created: \\$BACKUP_FILE\\\"
+
+                                                find \\\"\\$BACKUP_PATH\\\" \
+                                                    -name \\\"\\${APP_NAME}-*.jar\\\" \
+                                                    -mtime +7 \
+                                                    -delete
+
+                                            else
+
+                                                echo 'No previous Master API JAR found.'
+
+                                            fi
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Deploy JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            set -e
+
+                                            mkdir -p '${MASTER_DEPLOY_PATH}'
+
+                                            cp \
+                                                '${MASTER_DEPLOY_PATH}/.jenkins-deploy/${MASTER_JAR}-${BUILD_NUMBER}' \
+                                                '${MASTER_DEPLOY_PATH}/${MASTER_JAR}'
+                                            
+                                            chmod 755 \
+                                                '${MASTER_DEPLOY_PATH}/${MASTER_JAR}'
+                                            
+                                            rm -f \
+                                                '${MASTER_DEPLOY_PATH}/.jenkins-deploy/${MASTER_JAR}-${BUILD_NUMBER}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Start service
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            '${MASTER_DEPLOY_PATH}/${MASTER_START_SCRIPT}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Process verification
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            pgrep -af '${MASTER_JAR}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Health check
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command='
+
+                                            set -e
+
+                                            HEALTH_URL="http://localhost:8083/actuator/health"
+
+                                            for i in $(seq 1 15); do
+
+                                                echo "Health attempt $i/15"
+
+                                                STATUS=$(curl \
+                                                    -s \
+                                                    -o /tmp/health.json \
+                                                    -w "%{http_code}" \
+                                                    "$HEALTH_URL" || true)
+                                                
+                                                BODY=$(cat /tmp/health.json 2>/dev/null || true)
+                                                
+                                                echo "HTTP status: $STATUS"
+                                                echo "Response: $BODY"
+                                                
+                                                if [ "$STATUS" = "200" ] && \
+                                                   echo "$BODY" | grep -q 'status.*UP'; then
+                                                    echo "Master API is healthy."
+                                                    exit 0
+                                                fi
+
+                                                sleep 5
+
+                                            done
+
+                                            echo "Master API health check failed."
+
+                                            exit 1
+                                        '
+                                '''
+
+                                echo "Master API deployment successful."
+                                env.MASTER_DEPLOY_OK = 'true'
+
+                            }
+
+                            catch (err) {
+
+                                echo "Master API deployment failed."
+                                echo "Attempting rollback..."
+
+                                try {
+                                    sh '''
+                                        gcloud compute ssh \
+                                            "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                            --zone="${ZONE}" \
+                                            --command='
+    
+                                                set -e
+    
+                                                DEPLOY_PATH="/home/raos_infosoftjoin/auction_site/api"
+                                                BACKUP_PATH="/home/raos_infosoftjoin/auction_site/bak"
+                                                JAR_NAME="nivasabid.jar"
+    
+                                                BACKUP_FILE=$(ls -t \
+                                                    "$BACKUP_PATH"/auction-site-api-*.jar \
+                                                    2>/dev/null | head -n 1 || true)
+    
+                                                if [ -z "$BACKUP_FILE" ]; then
+    
+                                                    echo "No Master API backup found."
+    
+                                                    exit 1
+                                                fi
+    
+                                                echo "Rolling back to:"
+                                                echo "$BACKUP_FILE"
+    
+                                                pkill -f "$JAR_NAME" || true
+    
+                                                sleep 5
+    
+                                                cp \
+                                                    "$BACKUP_FILE" \
+                                                    "$DEPLOY_PATH/$JAR_NAME"
+    
+                                                chmod 755 \
+                                                    "$DEPLOY_PATH/$JAR_NAME"
+    
+                                                "$DEPLOY_PATH/start_service.sh"
+    
+                                                echo "Master API rollback completed."
+                                            '
+                                    '''
+                                } catch (rollbackErr) {
+                                    currentBuild.result = 'FAILURE'
+                                    echo "Rollback failed; continuing to the next service: ${rollbackErr}"
+                                }
+
+                                currentBuild.result = 'FAILURE'
+                            }
+                        }
+
+
+                        // =================================================
+                        // PARTICIPATION SERVICE
+                        // =================================================
+
+                        if (env.BUILD_PARTICIPATION == 'true') {
+
+                            echo ""
+                            echo "=========================================="
+                            echo "DEPLOYING PARTICIPATION SERVICE"
+                            echo "=========================================="
+
+                            try {
+
+                                // -----------------------------------------
+                                // Upload JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="mkdir -p '${PARTICIPATION_DEPLOY_PATH}/.jenkins-deploy'"
+
+                                    echo "Uploading Participation Service..."
+
+                                    gcloud compute scp \
+                                        "Participation_Service/target/${PARTICIPATION_JAR}" \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}:${PARTICIPATION_DEPLOY_PATH}/.jenkins-deploy/${PARTICIPATION_JAR}-${BUILD_NUMBER}" \
+                                        --zone="${ZONE}"
+                                '''
+
+
+                                // -----------------------------------------
+                                // Backup current JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            set -e
+
+                                            DEPLOY_PATH='${PARTICIPATION_DEPLOY_PATH}'
+                                            BACKUP_PATH='/home/raos_infosoftjoin/auction_site/bak/service'
+                                            JAR_NAME='${PARTICIPATION_JAR}'
+                                            APP_NAME='auction-participation-service'
+
+                                            mkdir -p \\\"\\$BACKUP_PATH\\\"
+
+                                            if [ -f \\\"\\$DEPLOY_PATH/\\$JAR_NAME\\\" ]; then
+
+                                                BACKUP_FILE=\\\"\\$BACKUP_PATH/\\${APP_NAME}-\\$(date +%Y%m%d-%H%M%S).jar\\\"
+
+                                                cp \
+                                                    \\\"\\$DEPLOY_PATH/\\$JAR_NAME\\\" \
+                                                    \\\"\\$BACKUP_FILE\\\"
+
+                                                echo \\\"Backup created: \\$BACKUP_FILE\\\"
+
+                                                find \\\"\\$BACKUP_PATH\\\" \
+                                                    -name \\\"\\${APP_NAME}-*.jar\\\" \
+                                                    -mtime +7 \
+                                                    -delete
+
+                                            else
+
+                                                echo 'No previous Participation Service JAR found.'
+
+                                            fi
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Deploy JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            set -e
+
+                                            mkdir -p '${PARTICIPATION_DEPLOY_PATH}'
+
+                                            cp \
+                                                '${PARTICIPATION_DEPLOY_PATH}/.jenkins-deploy/${PARTICIPATION_JAR}-${BUILD_NUMBER}' \
+                                                '${PARTICIPATION_DEPLOY_PATH}/${PARTICIPATION_JAR}'
+                                            
+                                            chmod 755 \
+                                                '${PARTICIPATION_DEPLOY_PATH}/${PARTICIPATION_JAR}'
+                                            
+                                            rm -f \
+                                                '${PARTICIPATION_DEPLOY_PATH}/.jenkins-deploy/${PARTICIPATION_JAR}-${BUILD_NUMBER}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Start service
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            '${PARTICIPATION_DEPLOY_PATH}/${PARTICIPATION_START_SCRIPT}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Process verification
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            pgrep -af '${PARTICIPATION_JAR}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Health check
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command='
+
+                                            set -e
+
+                                            HEALTH_URL="http://localhost:8087/actuator/health"
+
+                                            for i in $(seq 1 15); do
+
+                                                echo "Health attempt $i/15"
+
+                                                STATUS=$(curl \
+                                                    -s \
+                                                    -o /tmp/health.json \
+                                                    -w "%{http_code}" \
+                                                    "$HEALTH_URL" || true)
+                                                
+                                                BODY=$(cat /tmp/health.json 2>/dev/null || true)
+                                                
+                                                echo "HTTP status: $STATUS"
+                                                echo "Response: $BODY"
+                                                
+                                                if [ "$STATUS" = "200" ] && \
+                                                   echo "$BODY" | grep -q 'status.*UP'; then
+                                                    echo "Master API is healthy."
+                                                    exit 0
+                                                fi
+
+                                                sleep 5
+
+                                            done
+
+                                            echo "Participation Service health check failed."
+
+                                            exit 1
+                                        '
+                                '''
+
+                                echo "Participation Service deployment successful."
+                                env.PARTICIPATION_DEPLOY_OK = 'true'
+
+                            }
+
+                            catch (err) {
+
+                                echo "Participation Service deployment failed."
+                                echo "Attempting rollback..."
+
+                                try {
+                                    sh '''
+                                        gcloud compute ssh \
+                                            "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                            --zone="${ZONE}" \
+                                            --command='
+    
+                                                set -e
+    
+                                                DEPLOY_PATH="/home/raos_infosoftjoin/auction_site/services"
+                                                BACKUP_PATH="/home/raos_infosoftjoin/auction_site/bak/service"
+                                                JAR_NAME="auction-participation-service.jar"
+    
+                                                BACKUP_FILE=$(ls -t \
+                                                    "$BACKUP_PATH"/auction-participation-service-*.jar \
+                                                    2>/dev/null | head -n 1 || true)
+    
+                                                if [ -z "$BACKUP_FILE" ]; then
+    
+                                                    echo "No Participation Service backup found."
+    
+                                                    exit 1
+                                                fi
+    
+                                                echo "Rolling back to:"
+                                                echo "$BACKUP_FILE"
+    
+                                                pkill -f "$JAR_NAME" || true
+    
+                                                sleep 5
+    
+                                                cp \
+                                                    "$BACKUP_FILE" \
+                                                    "$DEPLOY_PATH/$JAR_NAME"
+    
+                                                chmod 755 \
+                                                    "$DEPLOY_PATH/$JAR_NAME"
+    
+                                                "$DEPLOY_PATH/start_service.sh"
+    
+                                                echo "Participation rollback completed."
+                                            '
+                                    '''
+                                } catch (rollbackErr) {
+                                    currentBuild.result = 'FAILURE'
+                                    echo "Rollback failed; continuing to the next service: ${rollbackErr}"
+                                }
+
+                                currentBuild.result = 'FAILURE'
+                            }
+                        }
+
+
+                        // =================================================
+                        // BIDDING SERVICE
+                        // =================================================
+
+                        if (env.BUILD_BIDDING == 'true') {
+
+                            echo ""
+                            echo "=========================================="
+                            echo "DEPLOYING BIDDING SERVICE"
+                            echo "=========================================="
+
+                            try {
+
+                                // -----------------------------------------
+                                // Upload JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="mkdir -p '${BIDDING_DEPLOY_PATH}/.jenkins-deploy'"
+
+                                    echo "Uploading Bidding Service..."
+
+                                    gcloud compute scp \
+                                        "Bidding_Service/target/${BIDDING_JAR}" \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}:${BIDDING_DEPLOY_PATH}/.jenkins-deploy/${BIDDING_JAR}-${BUILD_NUMBER}" \
+                                        --zone="${ZONE}"
+                                '''
+
+
+                                // -----------------------------------------
+                                // Backup current JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            set -e
+
+                                            DEPLOY_PATH='${BIDDING_DEPLOY_PATH}'
+                                            BACKUP_PATH='/home/raos_infosoftjoin/auction_site/bak/service'
+                                            JAR_NAME='${BIDDING_JAR}'
+                                            APP_NAME='auction-bidding-service'
+
+                                            mkdir -p \\\"\\$BACKUP_PATH\\\"
+
+                                            if [ -f \\\"\\$DEPLOY_PATH/\\$JAR_NAME\\\" ]; then
+
+                                                BACKUP_FILE=\\\"\\$BACKUP_PATH/\\${APP_NAME}-\\$(date +%Y%m%d-%H%M%S).jar\\\"
+
+                                                cp \
+                                                    \\\"\\$DEPLOY_PATH/\\$JAR_NAME\\\" \
+                                                    \\\"\\$BACKUP_FILE\\\"
+
+                                                echo \\\"Backup created: \\$BACKUP_FILE\\\"
+
+                                                find \\\"\\$BACKUP_PATH\\\" \
+                                                    -name \\\"\\${APP_NAME}-*.jar\\\" \
+                                                    -mtime +7 \
+                                                    -delete
+
+                                            else
+
+                                                echo 'No previous Bidding Service JAR found.'
+
+                                            fi
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Deploy JAR
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            set -e
+
+                                            mkdir -p '${BIDDING_DEPLOY_PATH}'
+
+                                            cp \
+                                                '${BIDDING_DEPLOY_PATH}/.jenkins-deploy/${BIDDING_JAR}-${BUILD_NUMBER}' \
+                                                '${BIDDING_DEPLOY_PATH}/${BIDDING_JAR}'
+
+                                            chmod 755 \
+                                                '${BIDDING_DEPLOY_PATH}/${BIDDING_JAR}'
+
+                                           rm -f \
+                                                '${BIDDING_DEPLOY_PATH}/.jenkins-deploy/${BIDDING_JAR}-${BUILD_NUMBER}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Start service
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            '${BIDDING_DEPLOY_PATH}/${BIDDING_START_SCRIPT}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Process verification
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command="
+                                            pgrep -af '${BIDDING_JAR}'
+                                        "
+                                '''
+
+
+                                // -----------------------------------------
+                                // Health check
+                                // -----------------------------------------
+
+                                sh '''
+                                    set -eux
+
+                                    gcloud compute ssh \
+                                        "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                        --zone="${ZONE}" \
+                                        --command='
+
+                                            set -e
+
+                                            HEALTH_URL="http://localhost:8088/actuator/health"
+
+                                            for i in $(seq 1 15); do
+
+                                                echo "Health attempt $i/15"
+
+                                                STATUS=$(curl \
+                                                    -s \
+                                                    -o /tmp/health.json \
+                                                    -w "%{http_code}" \
+                                                    "$HEALTH_URL" || true)
+                                                
+                                                BODY=$(cat /tmp/health.json 2>/dev/null || true)
+                                                
+                                                echo "HTTP status: $STATUS"
+                                                echo "Response: $BODY"
+                                                
+                                                if [ "$STATUS" = "200" ] && \
+                                                   echo "$BODY" | grep -q 'status.*UP'; then
+                                                    echo "Master API is healthy."
+                                                    exit 0
+                                                fi
+
+                                                sleep 10
+
+                                            done
+
+                                            echo "Bidding Service health check failed."
+
+                                            exit 1
+                                        '
+                                '''
+
+                                echo "Bidding Service deployment successful."
+                                env.BIDDING_DEPLOY_OK = 'true'
+
+                            }
+
+                            catch (err) {
+
+                                echo "Bidding Service deployment failed."
+                                echo "Attempting rollback..."
+
+                                try {
+                                    sh '''
+                                        gcloud compute ssh \
+                                            "${REMOTE_USER}@${INSTANCE_NAME}" \
+                                            --zone="${ZONE}" \
+                                            --command='
+    
+                                                set -e
+    
+                                                DEPLOY_PATH="/home/raos_infosoftjoin/auction_site/services"
+                                                BACKUP_PATH="/home/raos_infosoftjoin/auction_site/bak/service"
+                                                JAR_NAME="auction-bidding-service.jar"
+    
+                                                BACKUP_FILE=$(ls -t \
+                                                    "$BACKUP_PATH"/auction-bidding-service-*.jar \
+                                                    2>/dev/null | head -n 1 || true)
+    
+                                                if [ -z "$BACKUP_FILE" ]; then
+    
+                                                    echo "No Bidding Service backup found."
+    
+                                                    exit 1
+                                                fi
+    
+                                                echo "Rolling back to:"
+                                                echo "$BACKUP_FILE"
+    
+                                                pkill -f "$JAR_NAME" || true
+    
+                                                sleep 5
+    
+                                                cp \
+                                                    "$BACKUP_FILE" \
+                                                    "$DEPLOY_PATH/$JAR_NAME"
+    
+                                                chmod 755 \
+                                                    "$DEPLOY_PATH/$JAR_NAME"
+    
+                                                "$DEPLOY_PATH/auction-bidding.sh"
+    
+                                                echo "Bidding rollback completed."
+                                            '
+                                    '''
+                                } catch (rollbackErr) {
+                                    currentBuild.result = 'FAILURE'
+                                    echo "Rollback failed; continuing to the next service: ${rollbackErr}"
+                                }
+
+                                currentBuild.result = 'FAILURE'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Service Results') {
+            steps {
+                script {
+                    echo '================ SERVICE RESULTS ================'
+                    echo "Master API: changed=${env.BUILD_MASTER}, build=${env.MASTER_BUILD_OK}, deploy=${env.MASTER_DEPLOY_OK}"
+                    echo "Participation: changed=${env.BUILD_PARTICIPATION}, build=${env.PARTICIPATION_BUILD_OK}, deploy=${env.PARTICIPATION_DEPLOY_OK}"
+                    echo "Bidding: changed=${env.BUILD_BIDDING}, build=${env.BIDDING_BUILD_OK}, deploy=${env.BIDDING_DEPLOY_OK}"
+                    echo '=================================================='
+                }
+            }
+        }
+
+    }
+
+
+// =========================================================
+// POST
+// =========================================================
+
+post {
+
+    success {
+
+        echo ""
+
+        echo "=========================================="
+        echo "BACKEND QA PIPELINE SUCCESSFUL"
+        echo "=========================================="
+
+        echo ""
+
+        echo "Build Number : ${env.BUILD_NUMBER}"
+        echo "Branch       : ${env.BRANCH_NAME}"
+
+        echo ""
+
+        echo "Service decisions:"
+        echo "Master API       : ${env.BUILD_MASTER}"
+        echo "Participation    : ${env.BUILD_PARTICIPATION}"
+        echo "Bidding          : ${env.BUILD_BIDDING}"
+
+        echo ""
+
+        script {
+
+            if (env.BUILD_MASTER == 'false' &&
+                env.BUILD_PARTICIPATION == 'false' &&
+                env.BUILD_BIDDING == 'false') {
+
+                echo "No service changes detected."
+                echo "Nothing was built or deployed."
+
+            } else {
+
+                echo "Changed services were built and deployed."
+            }
+        }
+
+        echo "=========================================="
+    }
+
+
+    failure {
+
+        echo ""
+
+        echo "=========================================="
+        echo "BACKEND QA PIPELINE FAILED"
+        echo "=========================================="
+
+        echo ""
+
+        echo "Build Number : ${env.BUILD_NUMBER}"
+        echo "Branch       : ${env.BRANCH_NAME}"
+
+        echo ""
+        echo "A build or deployment operation failed."
+
+        echo "=========================================="
+    }
+
+
+    aborted {
+
+        echo ""
+
+        echo "=========================================="
+        echo "BACKEND QA PIPELINE ABORTED"
+        echo "=========================================="
+    }
+
+
+    always {
+
+        echo ""
+
+        echo "=========================================="
+        echo "BUILD INFORMATION"
+        echo "=========================================="
+
+        echo "Build Number : ${env.BUILD_NUMBER}"
+        echo "Branch       : ${env.BRANCH_NAME}"
+        echo "Commit       : ${env.GIT_COMMIT ?: 'N/A'}"
+
+        echo "=========================================="
+    }
+}
+}
